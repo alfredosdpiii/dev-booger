@@ -152,6 +152,11 @@ def _check_docker_compose(port: int, cwd: Path) -> DiscoveryResult | None:
 
 def _check_dockerfile(port: int, cwd: Path) -> DiscoveryResult | None:
     """Check Dockerfile for EXPOSE directive matching port."""
+    # Skip Dockerfile discovery for uv projects - Dockerfile is for containers,
+    # not local development. pyproject.toml discovery will handle uv projects.
+    if _is_uv_project(cwd):
+        return None
+
     dockerfile = cwd / "Dockerfile"
     if not dockerfile.exists():
         return None
