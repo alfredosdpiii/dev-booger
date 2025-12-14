@@ -93,7 +93,7 @@ def run_mcp_server():
 
 async def run_aggregator(ports: list[int], explicit_commands: dict[int, str]):
     """Run the log aggregator with the specified ports."""
-    store = LogStore()
+    store = LogStore(persist=True)  # Enable file persistence for MCP access
     manager = ProcessManager(store)
     cwd = Path.cwd()
 

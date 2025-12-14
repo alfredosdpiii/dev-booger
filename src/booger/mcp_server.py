@@ -2,13 +2,12 @@
 
 from fastmcp import FastMCP
 
-from .store import LogStore, store as default_store
+from .store import LogStore
 
 
-def create_mcp_server(log_store: LogStore | None = None) -> FastMCP:
-    """Create an MCP server with log tools."""
+def create_mcp_server() -> FastMCP:
+    """Create an MCP server with log tools that read from the shared log file."""
 
-    store = log_store or default_store
     mcp = FastMCP(name="booger")
 
     @mcp.tool()
@@ -20,6 +19,8 @@ def create_mcp_server(log_store: LogStore | None = None) -> FastMCP:
         """
         Get recent logs from all ports or a specific port.
 
+        Reads from the shared log file written by `booger <ports>` CLI.
+
         Args:
             port: Filter by port number (None for all ports)
             limit: Maximum number of logs to return (default 100)
@@ -28,7 +29,7 @@ def create_mcp_server(log_store: LogStore | None = None) -> FastMCP:
         Returns:
             List of log entries with port, message, level, timestamp
         """
-        return store.get(port=port, limit=limit, level=level)
+        return LogStore.load_from_file(limit=limit, port=port, level=level)
 
     @mcp.tool()
     def search_logs(
@@ -47,12 +48,12 @@ def create_mcp_server(log_store: LogStore | None = None) -> FastMCP:
         Returns:
             List of matching log entries
         """
-        return store.search(pattern=pattern, port=port, limit=limit)
+        return LogStore.search_from_file(pattern=pattern, port=port, limit=limit)
 
     @mcp.tool()
     def clear_logs(port: int | None = None) -> str:
         """
-        Clear logs from memory.
+        Clear logs from the shared log file.
 
         Args:
             port: Clear only this port's logs (None for all)
@@ -60,7 +61,7 @@ def create_mcp_server(log_store: LogStore | None = None) -> FastMCP:
         Returns:
             Confirmation message with count of cleared entries
         """
-        count = store.clear(port=port)
+        count = LogStore.clear_file(port=port)
         if port:
             return f"Cleared {count} log entries from port {port}"
         return f"Cleared {count} log entries from all ports"
@@ -73,7 +74,7 @@ def create_mcp_server(log_store: LogStore | None = None) -> FastMCP:
         Returns:
             Dict with ports, total entries, and entries per port
         """
-        return store.stats()
+        return LogStore.file_stats()
 
     return mcp
 

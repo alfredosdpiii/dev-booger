@@ -1,11 +1,17 @@
-"""In-memory log storage with search capabilities."""
+"""In-memory log storage with search capabilities and file persistence."""
 
+import json
 import re
 import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
+
+
+# Shared log file location
+LOG_FILE = Path.home() / ".cache" / "booger" / "logs.jsonl"
 
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "UNKNOWN"]
@@ -31,7 +37,7 @@ class LogEntry:
 
 
 class LogStore:
-    """Thread-safe in-memory log storage with ring buffer per port."""
+    """Thread-safe in-memory log storage with ring buffer per port and optional file persistence."""
 
     # Patterns to detect log levels
     LEVEL_PATTERNS = [
@@ -41,10 +47,15 @@ class LogStore:
         (re.compile(r"\bERR(?:OR)?\b", re.IGNORECASE), "ERROR"),
     ]
 
-    def __init__(self, max_lines_per_port: int = 5000):
+    def __init__(self, max_lines_per_port: int = 5000, persist: bool = False):
         self.max_lines = max_lines_per_port
         self.logs: dict[int, deque[LogEntry]] = {}
         self._lock = threading.Lock()
+        self.persist = persist
+
+        # Create log directory if persisting
+        if persist:
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     def _detect_level(self, message: str, stream: str) -> LogLevel:
         """Detect log level from message content."""
@@ -78,6 +89,11 @@ class LogStore:
             if port not in self.logs:
                 self.logs[port] = deque(maxlen=self.max_lines)
             self.logs[port].append(entry)
+
+        # Persist to file if enabled
+        if self.persist:
+            with open(LOG_FILE, "a") as f:
+                f.write(json.dumps(entry.to_dict()) + "\n")
 
         return entry
 
@@ -140,7 +156,152 @@ class LogStore:
             else:
                 count = sum(len(q) for q in self.logs.values())
                 self.logs.clear()
+                # Also clear the shared log file
+                if LOG_FILE.exists():
+                    LOG_FILE.unlink()
         return count
+
+    @staticmethod
+    def load_from_file(
+        limit: int = 100,
+        port: int | None = None,
+        level: str | None = None,
+    ) -> list[dict]:
+        """
+        Load logs from the shared log file.
+
+        Used by MCP server to read logs written by CLI process.
+        """
+        if not LOG_FILE.exists():
+            return []
+
+        entries = []
+        try:
+            with open(LOG_FILE) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        # Filter by port
+                        if port is not None and entry.get("port") != port:
+                            continue
+                        # Filter by level
+                        if level is not None and entry.get("level") != level:
+                            continue
+                        entries.append(entry)
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            return []
+
+        # Return most recent entries
+        return entries[-limit:]
+
+    @staticmethod
+    def search_from_file(
+        pattern: str,
+        port: int | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Search logs from the shared log file by regex pattern."""
+        if not LOG_FILE.exists():
+            return []
+
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            regex = re.compile(re.escape(pattern), re.IGNORECASE)
+
+        entries = []
+        try:
+            with open(LOG_FILE) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if port is not None and entry.get("port") != port:
+                            continue
+                        if regex.search(entry.get("message", "")):
+                            entries.append(entry)
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            return []
+
+        return entries[-limit:]
+
+    @staticmethod
+    def clear_file(port: int | None = None) -> int:
+        """Clear the shared log file. Returns count of entries cleared."""
+        if not LOG_FILE.exists():
+            return 0
+
+        if port is None:
+            # Clear entire file
+            try:
+                with open(LOG_FILE) as f:
+                    count = sum(1 for _ in f)
+                LOG_FILE.unlink()
+                return count
+            except OSError:
+                return 0
+        else:
+            # Filter out entries for specific port
+            try:
+                with open(LOG_FILE) as f:
+                    lines = f.readlines()
+
+                remaining = []
+                count = 0
+                for line in lines:
+                    try:
+                        entry = json.loads(line.strip())
+                        if entry.get("port") == port:
+                            count += 1
+                        else:
+                            remaining.append(line)
+                    except json.JSONDecodeError:
+                        remaining.append(line)
+
+                with open(LOG_FILE, "w") as f:
+                    f.writelines(remaining)
+
+                return count
+            except OSError:
+                return 0
+
+    @staticmethod
+    def file_stats() -> dict:
+        """Get statistics about the shared log file."""
+        if not LOG_FILE.exists():
+            return {"ports": [], "total_entries": 0, "entries_per_port": {}}
+
+        ports: dict[int, int] = {}
+        total = 0
+
+        try:
+            with open(LOG_FILE) as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line.strip())
+                        port = entry.get("port")
+                        if port is not None:
+                            ports[port] = ports.get(port, 0) + 1
+                            total += 1
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            pass
+
+        return {
+            "ports": list(ports.keys()),
+            "total_entries": total,
+            "entries_per_port": ports,
+        }
 
     def get_ports(self) -> list[int]:
         """Get list of ports with logs."""
