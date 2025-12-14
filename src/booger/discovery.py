@@ -214,8 +214,11 @@ def _check_env_files(port: int, cwd: Path) -> DiscoveryResult | None:
                         confidence="medium",
                     )
                 elif (cwd / "pyproject.toml").exists():
+                    use_uv = _is_uv_project(cwd)
+                    prefix = "uv run " if use_uv else ""
+                    app_path = _find_python_main(cwd)
                     return DiscoveryResult(
-                        command=f"uvicorn main:app --port {port} --reload",
+                        command=f"{prefix}uvicorn {app_path} --port {port} --reload --log-level debug",
                         source=f"{env_file} ({var_name}={port})",
                         confidence="medium",
                     )
@@ -287,49 +290,280 @@ def _check_python_project(port: int, cwd: Path) -> DiscoveryResult | None:
     try:
         content = pyproject.read_text()
 
-        # Check for framework dependencies
-        frameworks = {
-            "fastapi": {"port": 8000, "cmd": "uvicorn main:app --reload"},
-            "flask": {"port": 5000, "cmd": "flask run"},
-            "django": {"port": 8000, "cmd": "python manage.py runserver"},
-            "streamlit": {"port": 8501, "cmd": "streamlit run app.py"},
-            "gradio": {"port": 7860, "cmd": "python app.py"},
-        }
+        # Determine if we should use uv run
+        use_uv = _is_uv_project(cwd)
+        prefix = "uv run " if use_uv else ""
 
-        for framework, config in frameworks.items():
-            if config["port"] == port:
-                # Check if framework is in dependencies
-                if re.search(rf'["\']?{framework}["\']?\s*[>=<]', content, re.IGNORECASE):
-                    # Try to find main file
-                    main_file = _find_python_main(cwd)
-                    if framework == "fastapi" or framework == "uvicorn":
-                        cmd = f"uvicorn {main_file}:app --port {port} --reload"
-                    elif framework == "streamlit":
-                        cmd = f"streamlit run {main_file}.py --server.port {port}"
-                    else:
-                        cmd = config["cmd"]
+        # Check for framework dependencies - detect framework regardless of port
+        # For ASGI frameworks (fastapi, starlette, litestar) - generate uvicorn command
+        # Always use --reload and --log-level debug for maximum visibility
+        if re.search(r'["\']?fastapi["\']?\s*[>=<,\]]', content, re.IGNORECASE):
+            app_path = _find_python_main(cwd)
+            return DiscoveryResult(
+                command=f"{prefix}uvicorn {app_path} --port {port} --reload --log-level debug",
+                source="pyproject.toml",
+                confidence="medium",
+                framework="fastapi",
+            )
 
-                    return DiscoveryResult(
-                        command=cmd,
-                        source="pyproject.toml",
-                        confidence="medium",
-                        framework=framework,
-                    )
+        if re.search(r'["\']?starlette["\']?\s*[>=<,\]]', content, re.IGNORECASE):
+            app_path = _find_python_main(cwd)
+            return DiscoveryResult(
+                command=f"{prefix}uvicorn {app_path} --port {port} --reload --log-level debug",
+                source="pyproject.toml",
+                confidence="medium",
+                framework="starlette",
+            )
+
+        if re.search(r'["\']?litestar["\']?\s*[>=<,\]]', content, re.IGNORECASE):
+            app_path = _find_python_main(cwd)
+            return DiscoveryResult(
+                command=f"{prefix}litestar run --port {port} --reload --debug",
+                source="pyproject.toml",
+                confidence="medium",
+                framework="litestar",
+            )
+
+        if re.search(r'["\']?flask["\']?\s*[>=<,\]]', content, re.IGNORECASE):
+            app_path = _find_python_main(cwd)
+            return DiscoveryResult(
+                command=f"{prefix}flask --app {app_path} run --port {port} --reload --debug",
+                source="pyproject.toml",
+                confidence="medium",
+                framework="flask",
+            )
+
+        if re.search(r'["\']?django["\']?\s*[>=<,\]]', content, re.IGNORECASE):
+            return DiscoveryResult(
+                command=f"{prefix}python manage.py runserver {port}",
+                source="pyproject.toml",
+                confidence="medium",
+                framework="django",
+            )
+
+        if re.search(r'["\']?streamlit["\']?\s*[>=<,\]]', content, re.IGNORECASE):
+            result = _find_python_app_path(cwd)
+            if result:
+                module_path, _ = result
+                file_path = module_path.replace(".", "/") + ".py"
+            else:
+                file_path = "app.py"
+            return DiscoveryResult(
+                command=f"{prefix}streamlit run {file_path} --server.port {port}",
+                source="pyproject.toml",
+                confidence="medium",
+                framework="streamlit",
+            )
+
+        if re.search(r'["\']?gradio["\']?\s*[>=<,\]]', content, re.IGNORECASE):
+            result = _find_python_app_path(cwd)
+            if result:
+                module_path, _ = result
+                file_path = module_path.replace(".", "/") + ".py"
+            else:
+                file_path = "app.py"
+            return DiscoveryResult(
+                command=f"{prefix}python {file_path}",
+                source="pyproject.toml",
+                confidence="medium",
+                framework="gradio",
+            )
+
     except OSError:
         pass
     return None
 
 
+def _find_app_variable(file_path: Path) -> str | None:
+    """
+    Parse a Python file to find the ASGI/WSGI app variable name.
+
+    Looks for patterns like:
+    - app = FastAPI()
+    - application = Flask(__name__)
+    - api = Starlette()
+    - app = create_app()  (factory pattern)
+    """
+    try:
+        content = file_path.read_text()
+
+        # Direct instantiation patterns (with optional indentation)
+        frameworks = ["FastAPI", "Flask", "Starlette", "Litestar"]
+        for framework in frameworks:
+            # Match both module-level and indented: app = FastAPI(...)
+            match = re.search(rf'^\s*(\w+)\s*=\s*{framework}\s*\(', content, re.MULTILINE)
+            if match:
+                return match.group(1)
+
+        # Factory pattern: app = create_app() at module level (no indentation)
+        # Look for def create_app() -> FastAPI: ... then app = create_app()
+        if re.search(r'def\s+create_app\s*\([^)]*\)\s*->\s*FastAPI', content):
+            match = re.search(r'^(\w+)\s*=\s*create_app\s*\(', content, re.MULTILINE)
+            if match:
+                return match.group(1)
+
+        # Generic factory: app = something() at module level where something returns FastAPI
+        # Check for common patterns like get_app(), make_app(), build_app()
+        for factory in ["create_app", "get_app", "make_app", "build_app", "get_application"]:
+            match = re.search(rf'^(\w+)\s*=\s*{factory}\s*\(', content, re.MULTILINE)
+            if match:
+                return match.group(1)
+
+    except OSError:
+        pass
+
+    return None
+
+
+def _get_project_module_name(cwd: Path) -> str | None:
+    """
+    Extract the Python module name from pyproject.toml project name.
+
+    Converts 'ai-gateway' -> 'ai_gateway', 'my-cool-app' -> 'my_cool_app'
+    """
+    pyproject = cwd / "pyproject.toml"
+    if not pyproject.exists():
+        return None
+
+    try:
+        content = pyproject.read_text()
+        # Match name = "project-name" in [project] section
+        match = re.search(r'^\s*name\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
+        if match:
+            project_name = match.group(1)
+            # Convert to valid Python module name (hyphens -> underscores)
+            return project_name.replace("-", "_")
+    except OSError:
+        pass
+
+    return None
+
+
+def _is_uv_project(cwd: Path) -> bool:
+    """Check if this is a uv-managed project."""
+    # Check for uv.lock file
+    if (cwd / "uv.lock").exists():
+        return True
+
+    # Check for [tool.uv] in pyproject.toml
+    pyproject = cwd / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            content = pyproject.read_text()
+            if "[tool.uv]" in content:
+                return True
+        except OSError:
+            pass
+
+    return False
+
+
+def _find_python_app_path(cwd: Path) -> tuple[str, str] | None:
+    """
+    Discover the Python app path for uvicorn (e.g., 'ai_gateway.main:app').
+
+    Returns tuple of (module_path, app_var) or None.
+
+    Strategy:
+    1. Check pyproject.toml project name -> infer module directory
+    2. Scan root for Python packages with main.py/app.py containing FastAPI/Flask
+    3. Check common patterns (main.py, app.py in root)
+    """
+    # Strategy 1: Use project name from pyproject.toml
+    module_name = _get_project_module_name(cwd)
+    if module_name:
+        # Check if module directory exists in root
+        module_dir = cwd / module_name
+        if module_dir.is_dir() and (module_dir / "__init__.py").exists():
+            # Check main.py
+            main_py = module_dir / "main.py"
+            if main_py.exists():
+                app_var = _find_app_variable(main_py)
+                if app_var:
+                    return (f"{module_name}.main", app_var)
+
+            # Check app.py
+            app_py = module_dir / "app.py"
+            if app_py.exists():
+                app_var = _find_app_variable(app_py)
+                if app_var:
+                    return (f"{module_name}.app", app_var)
+
+        # Check src/{module}/
+        src_module = cwd / "src" / module_name
+        if src_module.is_dir() and (src_module / "__init__.py").exists():
+            main_py = src_module / "main.py"
+            if main_py.exists():
+                app_var = _find_app_variable(main_py)
+                if app_var:
+                    return (f"{module_name}.main", app_var)
+
+    # Strategy 2: Scan root for any Python package with FastAPI/Flask app
+    for item in cwd.iterdir():
+        if item.is_dir() and not item.name.startswith((".", "_", "test")):
+            if (item / "__init__.py").exists():
+                # Check main.py
+                main_py = item / "main.py"
+                if main_py.exists():
+                    app_var = _find_app_variable(main_py)
+                    if app_var:
+                        return (f"{item.name}.main", app_var)
+
+                # Check app.py
+                app_py = item / "app.py"
+                if app_py.exists():
+                    app_var = _find_app_variable(app_py)
+                    if app_var:
+                        return (f"{item.name}.app", app_var)
+
+    # Strategy 3: Check src/ directory
+    src_dir = cwd / "src"
+    if src_dir.exists():
+        for item in src_dir.iterdir():
+            if item.is_dir() and (item / "__init__.py").exists():
+                main_py = item / "main.py"
+                if main_py.exists():
+                    app_var = _find_app_variable(main_py)
+                    if app_var:
+                        return (f"{item.name}.main", app_var)
+
+                app_py = item / "app.py"
+                if app_py.exists():
+                    app_var = _find_app_variable(app_py)
+                    if app_var:
+                        return (f"{item.name}.app", app_var)
+
+    # Strategy 4: Check root main.py or app.py
+    root_main = cwd / "main.py"
+    if root_main.exists():
+        app_var = _find_app_variable(root_main)
+        if app_var:
+            return ("main", app_var)
+
+    root_app = cwd / "app.py"
+    if root_app.exists():
+        app_var = _find_app_variable(root_app)
+        if app_var:
+            return ("app", app_var)
+
+    return None
+
+
 def _find_python_main(cwd: Path) -> str:
-    """Find the main Python module for a project."""
-    # Common main file patterns
+    """Find the main Python module for a project (legacy, returns module:app format)."""
+    result = _find_python_app_path(cwd)
+    if result:
+        module_path, app_var = result
+        return f"{module_path}:{app_var}"
+
+    # Fallback to simple detection
     candidates = ["main", "app", "server", "api"]
 
     for candidate in candidates:
         if (cwd / f"{candidate}.py").exists():
-            return candidate
+            return f"{candidate}:app"
         if (cwd / "src" / f"{candidate}.py").exists():
-            return f"src.{candidate}"
+            return f"src.{candidate}:app"
 
     # Check for src/package structure
     src_dir = cwd / "src"
@@ -337,11 +571,11 @@ def _find_python_main(cwd: Path) -> str:
         for item in src_dir.iterdir():
             if item.is_dir() and (item / "__init__.py").exists():
                 if (item / "main.py").exists():
-                    return f"{item.name}.main"
+                    return f"{item.name}.main:app"
                 if (item / "app.py").exists():
-                    return f"{item.name}.app"
+                    return f"{item.name}.app:app"
 
-    return "main"
+    return "main:app"
 
 
 def _check_procfile(port: int, cwd: Path) -> DiscoveryResult | None:
